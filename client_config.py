@@ -12,7 +12,7 @@ import agent_budget
 CLIENTS = ("claude-desktop", "claude-code", "cursor", "codex", "copilot", "vscode", "generic")
 
 
-def configuration(client, root, state=None, response_bytes=6000, evidence_bytes=24000, calls=12):
+def configuration(client, root, state=None, response_bytes=6000, evidence_bytes=24000, calls=agent_budget.DEFAULT_CALLS):
     if client not in CLIENTS:
         raise ValueError("Unsupported client")
     root = root.resolve(strict=True)
@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--state", type=Path)
     parser.add_argument("--response-bytes", type=int, default=6000)
     parser.add_argument("--evidence-bytes", type=int, default=24000)
-    parser.add_argument("--calls", type=int, default=12)
+    parser.add_argument("--calls", type=int, default=agent_budget.DEFAULT_CALLS)
     parser.add_argument("--output", type=Path, help="Create a new file; never overwrite existing settings")
     args = parser.parse_args()
     try:

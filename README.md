@@ -176,12 +176,26 @@ for one task so cumulative retrieval/call budgets apply.
 ## What is actually enforced
 
 The broker caps each JSON evidence payload at 6,000 UTF-8 bytes, cumulative
-evidence/error payloads at approximately 24,000 bytes, and tool execution at 12
-attempts per process. Once exhausted, it returns a small explicit stop error;
+evidence/error payloads at approximately 24,000 bytes, and tool execution at 40
+attempts per budget window (`AGENT_BUDGET_CALLS` overrides the default). Once exhausted, it returns a small explicit stop error;
 repeated stop errors and MCP envelopes are outside the evidence budget. These
 are **byte budgets, not exact tokenizer counts or complete request limits**.
 You can set `--response-bytes`, `--evidence-bytes`, and `--calls` after `serve`.
 Standalone `search`/`read` commands each start a new budget.
+
+**Budget window is a proxy, not a real task boundary.** MCP gives the server no
+"task started/ended" signal. The budget resets when the client sends a new
+`initialize` (a new MCP session; over stdio that is usually a new process) or
+after `AGENT_BUDGET_IDLE_SECONDS` (default 600) with no calls. A long-lived
+client that runs several tasks back to back without a 10-minute gap shares one
+budget; a single task that pauses for more than 10 minutes gets a fresh one.
+
+**Call log.** Every CLI/`serve` call appends one JSON line to
+`<state>/calls.jsonl` (directory 0700, file created 0600): `ts`, `tool`,
+`paths` (relative), `bytes_returned`, `full_bytes` (on-disk size of the files
+touched), `budget_hit`. No query text or file content is logged. Run
+`agent_budget.py --root <workspace> --state <state> stats` to print totals and
+the returned/full ratio with percent saved.
 
 Search returns at most eight ranked section hits. Reads return complete lines,
 source hashes, and an explicit continuation pointer. Changed or missing sources

@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 
 
 EXTENSIONS = {
@@ -26,6 +27,9 @@ EXCLUDED = {
 SENSITIVE = ("*.env*", "*secret*", "*credential*", "*private*key*", "*.pem", "*.key")
 MAX_FILE_BYTES = 1_000_000
 MAX_FILES = 10_000
+DEFAULT_CALLS = int(os.environ.get("AGENT_BUDGET_CALLS", "40"))
+# shortcut: MCP has no task boundary; reset after this idle gap or a new initialize, upgrade if MCP adds one.
+IDLE_SECONDS = float(os.environ.get("AGENT_BUDGET_IDLE_SECONDS", "600"))
 
 
 def encode(value):
@@ -138,7 +142,7 @@ def index_workspace(root, state, patterns):
 
 
 class Broker:
-    def __init__(self, root, state, response_bytes=6000, evidence_bytes=24000, calls=12):
+    def __init__(self, root, state, response_bytes=6000, evidence_bytes=24000, calls=DEFAULT_CALLS, log=None):
         if not 512 <= response_bytes <= 64000 or not 512 <= evidence_bytes <= 1_000_000:
             raise ValueError("Byte budgets out of range")
         if not 1 <= calls <= 100:
@@ -150,8 +154,34 @@ class Broker:
             self.db.close()
             raise ValueError("Index root mismatch")
         self.response_bytes = response_bytes
-        self.remaining = evidence_bytes
-        self.calls = calls
+        self.budget = (evidence_bytes, calls)
+        self.reset()
+        self.log = log
+        if log:
+            log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(log.parent, 0o700)
+
+    def reset(self):
+        self.remaining, self.calls = self.budget
+        self.last_call = time.monotonic()
+
+    def record(self, name, result):
+        if not self.log:
+            return
+        paths = sorted({m["path"] for m in result.get("matches", [])} | (
+            {result["path"]} if "path" in result else set()))
+        full = 0
+        for path in paths:
+            try:
+                full += (self.root / path).stat().st_size
+            except OSError:
+                pass
+        line = encode({"ts": time.time(), "tool": name.removeprefix("agentbudget_"), "paths": paths,
+                       "bytes_returned": len(encode(result).encode("utf-8")), "full_bytes": full,
+                       "budget_hit": "budget" in result.get("error", "").lower()})
+        fd = os.open(self.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
 
     def close(self):
         self.db.close()
@@ -220,6 +250,14 @@ class Broker:
         return result
 
     def call(self, name, arguments):
+        result = self._call(name, arguments)
+        self.record(str(name), result)
+        return result
+
+    def _call(self, name, arguments):
+        if time.monotonic() - self.last_call > IDLE_SECONDS:
+            self.reset()
+        self.last_call = time.monotonic()
         if self.calls <= 0 or self.remaining < 256:
             return {"error": "Budget exhausted; stop. Work may be incomplete."}
         self.calls -= 1
@@ -270,6 +308,7 @@ def serve(broker, incoming=sys.stdin, outgoing=sys.stdout):
         method = message.get("method")
         response = {"jsonrpc": "2.0", "id": message["id"]}
         if method == "initialize":
+            broker.reset()  # a new MCP session is the closest task boundary stdio gives us
             response["result"] = {
                 "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "agent-budget", "version": "0.1.0"},
@@ -290,6 +329,19 @@ def serve(broker, incoming=sys.stdin, outgoing=sys.stdout):
             response["error"] = {"code": -32601, "message": "Unknown method"}
         outgoing.write(encode(response) + "\n")
         outgoing.flush()
+
+
+def stats(log):
+    returned = full = calls = 0
+    if log.is_file():
+        for line in log.read_text(encoding="utf-8").splitlines():
+            entry = json.loads(line)
+            calls += 1
+            returned += entry["bytes_returned"]
+            full += entry["full_bytes"]
+    ratio = returned / full if full else 0.0
+    return (f"calls={calls} returned={returned} full={full} "
+            f"ratio={ratio:.4f} saved={(1 - ratio) * 100 if full else 0.0:.1f}%")
 
 
 def launch_command(root, state, prompt):
@@ -338,13 +390,14 @@ def main():
         command = commands.add_parser(name)
         command.add_argument("--response-bytes", type=int, default=6000)
         command.add_argument("--evidence-bytes", type=int, default=24000)
-        command.add_argument("--calls", type=int, default=12)
+        command.add_argument("--calls", type=int, default=DEFAULT_CALLS)
         if name == "search":
             command.add_argument("query")
         elif name == "read":
             command.add_argument("path")
             command.add_argument("--start", type=int, default=1)
             command.add_argument("--lines", type=int, default=40)
+    commands.add_parser("stats", help="Sum the call log and print the savings ratio")
     launch = commands.add_parser("copilot")
     launch.add_argument("prompt")
     launch.add_argument("--run", action="store_true", help="Launch interactive CLI; otherwise print configuration")
@@ -357,19 +410,22 @@ def main():
         if args.command == "index":
             print(encode(index_workspace(root, state, args.exclude)))
             return 0
+        if args.command == "stats":
+            print(stats(state / "calls.jsonl"))
+            return 0
         if args.command == "copilot":
             if not (state / "index.sqlite3").is_file():
                 raise ValueError("Index workspace before launching Copilot")
             command = launch_command(root, state, args.prompt)
             print(encode({"command": command, "limits": {
                 "broker_response_bytes": 6000, "broker_evidence_bytes": 24000,
-                "broker_calls": 12, "exact_tokens": False, "model_output_cap": False,
+                "broker_calls": DEFAULT_CALLS, "exact_tokens": False, "model_output_cap": False,
                 "hidden_context_control": False, "silent_success": "advisory",
-                "mode": "read-only", "scope": "one broker process",
+                "mode": "read-only", "scope": "per MCP session or idle gap",
                 "host_integration": "Copilot CLI only; revalidate after CLI updates",
             }}), flush=True)
             return subprocess.call(command) if args.run else 0
-        broker = Broker(root, state, args.response_bytes, args.evidence_bytes, args.calls)
+        broker = Broker(root, state, args.response_bytes, args.evidence_bytes, args.calls, state / "calls.jsonl")
         try:
             if args.command == "serve":
                 serve(broker)

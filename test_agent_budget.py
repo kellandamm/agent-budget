@@ -197,6 +197,53 @@ class BrokerTests(unittest.TestCase):
         with patch.object(ab, "state_directory", return_value=self.state), self.assertRaises(ValueError):
             package_desktop.package(self.root, destination)
 
+    def test_log_line_shape_mode_and_no_content(self):
+        log = self.state / "logs" / "calls.jsonl"
+        broker = self.broker(log=log)
+        broker.call("agentbudget_search", {"query": "retrieval secretquery"})
+        broker.call("agentbudget_read", {"path": "guide.md", "lines": 3})
+        entries = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual([e["tool"] for e in entries], ["search", "read"])
+        size = (self.root / "guide.md").stat().st_size
+        for entry in entries:
+            self.assertEqual(set(entry), {"ts", "tool", "paths", "bytes_returned", "full_bytes", "budget_hit"})
+            self.assertEqual((entry["paths"], entry["full_bytes"], entry["budget_hit"]), (["guide.md"], size, False))
+        text = log.read_text()
+        self.assertNotIn("retrieval", text)
+        self.assertNotIn("secretquery", text)
+        if os.name != "nt":
+            self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(log.parent.stat().st_mode & 0o777, 0o700)
+        broker = self.broker(calls=1, log=log)
+        broker.call("agentbudget_read", {"path": "guide.md"})
+        broker.call("agentbudget_read", {"path": "guide.md"})
+        self.assertTrue(json.loads(log.read_text().splitlines()[-1])["budget_hit"])
+
+    def test_stats_math(self):
+        log = self.state / "calls.jsonl"
+        log.write_text('{"bytes_returned":100,"full_bytes":1000}\n{"bytes_returned":150,"full_bytes":4000}\n')
+        self.assertEqual(ab.stats(log), "calls=2 returned=250 full=5000 ratio=0.0500 saved=95.0%")
+        self.assertIn("calls=0", ab.stats(self.state / "missing.jsonl"))
+
+    def test_call_limit_40_and_env_override(self):
+        self.assertEqual(ab.DEFAULT_CALLS, 40)
+        self.assertEqual(self.broker().calls, 40)
+        code = "import agent_budget; print(agent_budget.DEFAULT_CALLS)"
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                             cwd=Path(ab.__file__).parent, env={**os.environ, "AGENT_BUDGET_CALLS": "7"})
+        self.assertEqual(out.stdout.strip(), "7")
+
+    def test_idle_and_session_reset(self):
+        broker = self.broker(calls=1)
+        broker.call("agentbudget_search", {"query": "retrieval"})
+        self.assertIn("Budget exhausted", broker.call("agentbudget_search", {"query": "retrieval"})["error"])
+        broker.last_call -= ab.IDLE_SECONDS + 1
+        self.assertNotIn("error", broker.call("agentbudget_search", {"query": "retrieval"}))
+        self.assertIn("error", broker.call("agentbudget_search", {"query": "retrieval"}))
+        out = io.StringIO()
+        ab.serve(broker, io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), out)
+        self.assertNotIn("error", broker.call("agentbudget_search", {"query": "retrieval"}))
+
 
 if __name__ == "__main__":
     unittest.main()
