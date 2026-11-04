@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "agentbudget": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-u", "${PLUGIN_ROOT}/plugin_server.py"],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}
